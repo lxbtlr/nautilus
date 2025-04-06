@@ -1,49 +1,47 @@
 
 #include "../debug.h"
-#include "pte_types.h"
 #include "pte_osal.h"
+#include "pte_types.h"
+#include <nautilus/atomic.h>
 #include <nautilus/libccompat.h>
 #include <nautilus/scheduler.h>
 #include <nautilus/semaphore.h>
+#include <nautilus/timer.h>
 #include <nautilus/waitqueue.h>
-#include <nautilus/atomic.h>
 
 #define BOGUS_FUN_ERR() ERROR_PRINT("Function (%s) is BOGUS\n", __func__)
 #define BOGUS() BOGUS_FUN_ERR()
 
-#define STATE_UNLOCK(a,b) spin_unlock_irq_restore(a,b)
-#define STATE_TRY_LOCK(a,b) spin_try_lock_irq_save(a,b)
+#define STATE_UNLOCK(a, b) spin_unlock_irq_restore(a, b)
+#define STATE_TRY_LOCK(a, b) spin_try_lock_irq_save(a, b)
 #define STATE_LOCK(a) spin_lock_irq_save(a)
-#define RESTORE_UNIRQ(a,b) irq_enable_restore(b)
+#define RESTORE_UNIRQ(a, b) irq_enable_restore(b)
 
+#define ZOMBIE 200       // after busy wait for ZOMBIE time check condition
+#define ZOMBIE_mode true // Put to sleep if true after ZOMBIE time
 
-#define ZOMBIE 200  //after busy wait for ZOMBIE time check condition
-#define ZOMBIE_mode true //Put to sleep if true after ZOMBIE time
-
-
-//retrive osHandle from thread
-#define poffsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+// retrive osHandle from thread
+#define poffsetof(TYPE, MEMBER) ((size_t) & ((TYPE*)0)->MEMBER)
 #define pcontainer_of(ptr, type, member) ({                      \
         const typeof( ((type *)0)->member ) *__mptr = (typeof(((type *)0)->member)) (ptr);    \
-        (type *)( (char *)__mptr - offsetof(type,member) );})
+        (type *)( (char *)__mptr - offsetof(type,member) ); })
 
-#define  TIME() (unsigned int)nk_sched_get_realtime();
+#define TIME() (unsigned int)nk_sched_get_realtime();
 
-//nano s to micro seconds
-#define  NS 1000000ULL
+// nano s to micro seconds
+#define NS 1000000ULL
 
-
-//specific/duplicate of nk function goes here
-static int exit_check(void *state)
+// specific/duplicate of nk function goes here
+static int exit_check(void* state)
 {
-    volatile nk_thread_t *thethread = (nk_thread_t *)state;
+  volatile nk_thread_t* thethread = (nk_thread_t*)state;
 
-    DEBUG("exit_check: thread (%lu %s) status is %u\n",thethread->tid,thethread->name,thethread->status);
-    return thethread->status==NK_THR_EXITED;
+  DEBUG("exit_check: thread (%lu %s) status is %u\n", thethread->tid, thethread->name, thethread->status);
+  return thethread->status == NK_THR_EXITED;
 }
 
-
-pte_osResult pte_osInit(void){
+pte_osResult pte_osInit(void)
+{
   return PTE_OS_OK;
 }
 
@@ -55,15 +53,17 @@ pte_osResult pte_osInit(void){
  * @return PTE_OS_NO_RESOURCESs - Insufficient resources to create mutex
  *==========================================================================*/
 
-pte_osResult pte_osMutexCreate(pte_osMutexHandle *pHandle){
+pte_osResult pte_osMutexCreate(pte_osMutexHandle* pHandle)
+{
 
-   *pHandle = malloc(sizeof(struct pmutex));
-   spinlock_init(&((*pHandle)->lock));
-   DEBUG("osMutexCreate\n");
-   return PTE_OS_OK;
+  *pHandle = malloc(sizeof(struct pmutex));
+  spinlock_init(&((*pHandle)->lock));
+  DEBUG("osMutexCreate\n");
+  return PTE_OS_OK;
 }
 
-pte_osResult pte_osMutexDelete(pte_osMutexHandle handle){
+pte_osResult pte_osMutexDelete(pte_osMutexHandle handle)
+{
   spinlock_deinit(&(handle->lock));
   DEBUG("osMutexDelete\n");
   return PTE_OS_OK;
@@ -76,32 +76,32 @@ pte_osResult pte_osMutexDelete(pte_osMutexHandle handle){
  *
  * @return PTE_OS_OK - Mutex successfully locked.
  *=================================================================*/
-pte_osResult pte_osMutexLock(pte_osMutexHandle handle){
+pte_osResult pte_osMutexLock(pte_osMutexHandle handle)
+{
 
   handle->flags = STATE_LOCK(&(handle->lock));
   DEBUG("osMutexLock\n");
   return PTE_OS_OK;
-  
 }
 
-
-pte_osResult pte_osMutexTimedLock(pte_osMutexHandle handle, unsigned int timeout){
+pte_osResult pte_osMutexTimedLock(pte_osMutexHandle handle, unsigned int timeout)
+{
   unsigned int start = TIME();
   unsigned int end = start;
   int res = -1;
-  while( (end-start) <timeout*NS ){
-    res=STATE_TRY_LOCK(&(handle->lock), &(handle->flags) );
+  while ((end - start) < timeout * NS) {
+    res = STATE_TRY_LOCK(&(handle->lock), &(handle->flags));
     DEBUG("osMutexTimedLock\n");
     end = TIME();
-    if(res == 0){
+    if (res == 0) {
       return PTE_OS_OK;
     }
   }
   return PTE_OS_TIMEOUT;
 }
 
-
-pte_osResult pte_osMutexUnlock(pte_osMutexHandle handle){
+pte_osResult pte_osMutexUnlock(pte_osMutexHandle handle)
+{
   STATE_UNLOCK(&(handle->lock), handle->flags);
   DEBUG("osMutexUnlock\n");
   return PTE_OS_OK;
@@ -122,34 +122,34 @@ pte_osResult pte_osMutexUnlock(pte_osMutexHandle handle){
  * @return PTE_OS_NO_RESOURCES - Insufficient resources to create thread
  *============================================================================================================*/
 pte_osResult pte_osThreadCreate(pte_osThreadEntryPoint entryPoint,
-                                int stackSize,
-                                int initialPriority,
-                                void *argv,
-                                pte_osThreadHandle* handle)
+    int stackSize,
+    int initialPriority,
+    void* argv,
+    pte_osThreadHandle* handle)
 {
-  //pte_osThreadEntryPoint is nk_thread_fun
-  //pte_osThreadhandle will be nk_thread_id
+  // pte_osThreadEntryPoint is nk_thread_fun
+  // pte_osThreadhandle will be nk_thread_id
 
   pte_osThreadHandle handleobj = malloc(sizeof(struct thread_with_signal));
 
-  memset(handleobj,0,sizeof(struct thread_with_signal));
+  memset(handleobj, 0, sizeof(struct thread_with_signal));
 
-  int ret = nk_thread_create(entryPoint, argv, NULL, false,(nk_stack_size_t) stackSize, &(handleobj->tid),-1);
-  if (ret != 0){
+  int ret = nk_thread_create(entryPoint, argv, NULL, false, (nk_stack_size_t)stackSize, &(handleobj->tid), -1);
+  if (ret != 0) {
     ERROR("create error exit\n");
     return PTE_OS_NO_RESOURCES;
   }
-  
-  *handle = handleobj;
-  struct nk_thread* thread = (struct nk_thread*) (*handle)->tid;
 
-  DEBUG("osThreadCreate %p, %lu ref %lu\n",  thread, thread->tid, thread->refcount);
- 
+  *handle = handleobj;
+  struct nk_thread* thread = (struct nk_thread*)(*handle)->tid;
+
+  DEBUG("osThreadCreate %p, %lu ref %lu\n", thread, thread->tid, thread->refcount);
+
   return PTE_OS_OK;
 }
 
-
-pte_osResult pte_osThreadStart(pte_osThreadHandle handle){
+pte_osResult pte_osThreadStart(pte_osThreadHandle handle)
+{
 
   nk_thread_run(handle->tid);
   DEBUG("osThreadStart %08x\n", handle);
@@ -157,50 +157,53 @@ pte_osResult pte_osThreadStart(pte_osThreadHandle handle){
   return PTE_OS_OK;
 }
 
-void pte_osThreadExit(){
+void pte_osThreadExit()
+{
   DEBUG("osthread EXIT\n");
   nk_thread_exit(NULL);
 }
 
-
 /*=================================================================*
- * Waits for the specified thread to end.  
+ * Waits for the specified thread to end.
  * If the thread has already terminated, this returns  immediately.
  * @param threadHandle Handle fo thread to wait for.
  *
  * @return PTE_OS_OK - specified thread terminated.
  *=================================================================*/
-pte_osResult pte_osThreadWaitForEnd(pte_osThreadHandle threadHandle){
+pte_osResult pte_osThreadWaitForEnd(pte_osThreadHandle threadHandle)
+{
   DEBUG("pte osThread Wait For End\n");
-  nk_thread_t *thethread = (nk_thread_t*) (threadHandle->tid);
+  nk_thread_t* thethread = (nk_thread_t*)(threadHandle->tid);
 
   // both ok
-  //nk_wait_queue_sleep_extended(thethread->waitq, exit_check, thethread);
-  
+  // nk_wait_queue_sleep_extended(thethread->waitq, exit_check, thethread);
+
   return nk_join(thethread, NULL);
 }
-
 
 /*=================================================================*
  * Returns the handle of the currently executing thread.
  *=================================================================*/
-pte_osThreadHandle pte_osThreadGetHandle(void){
-  //note pte_osThreadHandle is a pointer of struct _thread_with_signal
+pte_osThreadHandle pte_osThreadGetHandle(void)
+{
+  // note pte_osThreadHandle is a pointer of struct _thread_with_signal
   nk_thread_t* thethread = get_cur_thread();
   DEBUG("osThreadGetHandle\n");
-  return (pte_osThreadHandle) pcontainer_of(thethread,struct thread_with_signal, tid);
+  return (pte_osThreadHandle)pcontainer_of(thethread, struct thread_with_signal, tid);
 }
 
-int pte_osThreadGetPriority(pte_osThreadHandle threadHandle){
+int pte_osThreadGetPriority(pte_osThreadHandle threadHandle)
+{
   return 0;
 }
 
-pte_osResult pte_osThreadSetPriority(pte_osThreadHandle threadHandle, int newPriority){
+pte_osResult pte_osThreadSetPriority(pte_osThreadHandle threadHandle, int newPriority)
+{
   return PTE_OS_OK;
-
 }
 
-pte_osResult pte_osThreadDelete(pte_osThreadHandle handle){
+pte_osResult pte_osThreadDelete(pte_osThreadHandle handle)
+{
   DEBUG("osThreadDelete\n");
   nk_thread_exit(NULL);
   return PTE_OS_OK;
@@ -211,11 +214,11 @@ pte_osResult pte_osThreadDelete(pte_osThreadHandle handle){
  * This is called after the thread has terminated and is no longer needed (e.g. after
  * pthread_join returns).  This call will always be made from the context of the target thread.
  *===============================================================================================*/
-pte_osResult pte_osThreadExitAndDelete(pte_osThreadHandle handle){
+pte_osResult pte_osThreadExitAndDelete(pte_osThreadHandle handle)
+{
 
   DEBUG("osThreadExitDelete\n");
   nk_thread_exit(NULL);
-
 }
 
 /*=======================================================================================
@@ -226,52 +229,56 @@ pte_osResult pte_osThreadExitAndDelete(pte_osThreadHandle handle){
  * @param threadHandle handle to the thread to cancel.
  * @return Thread successfully canceled.
  *=======================================================================================*/
-pte_osResult pte_osThreadCancel(pte_osThreadHandle handle){
-   ERROR("osThreadCancel \n");
-   return PTE_OS_GENERAL_FAILURE;
+pte_osResult pte_osThreadCancel(pte_osThreadHandle handle)
+{
+  ERROR("osThreadCancel \n");
+  return PTE_OS_GENERAL_FAILURE;
 
-   handle->signal = NK_THREAD_CANCEL;
-   // if thread is waiting in queue, wake up
-   /* if(handle->in_queue){ */
-   /*   nk_wait_queue_wake_all(handle->in_queue); */
-   /* } */   
-   return PTE_OS_OK;  
+  handle->signal = NK_THREAD_CANCEL;
+  // if thread is waiting in queue, wake up
+  /* if(handle->in_queue){ */
+  /*   nk_wait_queue_wake_all(handle->in_queue); */
+  /* } */
+  return PTE_OS_OK;
 }
 
-//CANCEL not supported
-pte_osResult pte_osThreadCheckCancel(pte_osThreadHandle handle){
+// CANCEL not supported
+pte_osResult pte_osThreadCheckCancel(pte_osThreadHandle handle)
+{
 
-    ERROR("osThreadCheckCancel\n");
+  ERROR("osThreadCheckCancel\n");
+  return PTE_OS_OK;
+  nk_thread_t* thethread = (nk_thread_t*)handle->tid;
+
+  if (thethread->status == NK_THR_EXITED) {
+    return PTE_OS_INTERRUPTED;
+  } else {
     return PTE_OS_OK;
-    nk_thread_t * thethread = (nk_thread_t*) handle->tid;
-    
-    if (thethread->status ==NK_THR_EXITED){
-      return PTE_OS_INTERRUPTED;
-    }else{
-      return PTE_OS_OK;
-    }
+  }
 }
 
 /*===================================================*/
 /* indeed yield operation, do not use wait queue     */
 /* fast yield                                        */
 /*===================================================*/
-void pte_osThreadSleep(unsigned int msecs){
-  nk_sleep(msecs*1000000UL);
+void pte_osThreadSleep(unsigned int msecs)
+{
+  nk_sleep(msecs * 1000000UL);
 }
 
 /*=============================================
  * Returns the maximum allowable priority
  *============================================*/
-int pte_osThreadGetMaxPriority(){
+int pte_osThreadGetMaxPriority()
+{
   return 3;
-
 }
 
 /*==========================================*
  * Returns the minimum allowable priority
  *=========================================*/
-int pte_osThreadGetMinPriority(){
+int pte_osThreadGetMinPriority()
+{
   return 0;
 }
 
@@ -279,7 +286,8 @@ int pte_osThreadGetMinPriority(){
  * Returns the priority that should be used if the caller to pthread_create doesn't
  * explicitly set one.
  *===================================================================================*/
-int pte_osThreadGetDefaultPriority(){
+int pte_osThreadGetDefaultPriority()
+{
   return 0;
 }
 
@@ -292,13 +300,14 @@ int pte_osThreadGetDefaultPriority(){
  * @return PTE_OS_OK - Semaphore successfully created
  * @return PTE_OS_NO_RESOURCESs - Insufficient resources to create semaphore
  *==================================================================================*/
-pte_osResult pte_osSemaphoreCreate(int initialValue, pte_osSemaphoreHandle *pHandle){
+pte_osResult pte_osSemaphoreCreate(int initialValue, pte_osSemaphoreHandle* pHandle)
+{
 
-   //pte_osSemaphoreHandle is nk_semaphore
-   DEBUG("osSemaphoreCreate\n");
-   
-   *pHandle = malloc(sizeof(struct psemaphore));
-   memset(*pHandle,0,sizeof(struct psemaphore));
+  // pte_osSemaphoreHandle is nk_semaphore
+  DEBUG("osSemaphoreCreate\n");
+
+  *pHandle = malloc(sizeof(struct psemaphore));
+  memset(*pHandle, 0, sizeof(struct psemaphore));
 
   spinlock_init(&((*pHandle)->lock));
   (*pHandle)->count = 0;
@@ -306,11 +315,11 @@ pte_osResult pte_osSemaphoreCreate(int initialValue, pte_osSemaphoreHandle *pHan
   (*pHandle)->wait_queue = nk_wait_queue_create(NULL);
 
   if (!(*pHandle)->wait_queue) {
-        free(*pHandle);
-        ERROR("Failed to allocate wait queue\n");
-        return  PTE_OS_NO_RESOURCES;
-    }
-  
+    free(*pHandle);
+    ERROR("Failed to allocate wait queue\n");
+    return PTE_OS_NO_RESOURCES;
+  }
+
   return PTE_OS_OK;
 }
 
@@ -321,8 +330,9 @@ pte_osResult pte_osSemaphoreCreate(int initialValue, pte_osSemaphoreHandle *pHan
  *
  * @return PTE_OS_OK - Semaphore successfully deleted.
  *===============================================================*/
-pte_osResult pte_osSemaphoreDelete(pte_osSemaphoreHandle handle){
-  //nk_semaphore_release(handle);
+pte_osResult pte_osSemaphoreDelete(pte_osSemaphoreHandle handle)
+{
+  // nk_semaphore_release(handle);
   spinlock_deinit(&(handle->lock));
   free(handle);
   DEBUG("osSemaphoreDelete\n");
@@ -337,24 +347,25 @@ pte_osResult pte_osSemaphoreDelete(pte_osSemaphoreHandle handle){
  *
  * @return PTE_OS_OK - semaphore successfully released.
  *================================================================*/
-pte_osResult pte_osSemaphorePost(pte_osSemaphoreHandle handle, int count){
+pte_osResult pte_osSemaphorePost(pte_osSemaphoreHandle handle, int count)
+{
 
-    DEBUG("releaseosSemaphorePost\n");
-    
-    handle->flags = STATE_LOCK(&(handle->lock));
-    handle->count += count;
-    // int old = pte_osAtomicAdd(&(handle->count), count);
-    int a = count;
-    if(a > handle->sleepcount){
-      a = handle->sleepcount;
-    }
-    handle->sleepcount -= a;
-    while(a--){
-       nk_wait_queue_wake_one(handle->wait_queue);
-    }
-    
-    STATE_UNLOCK(&(handle->lock), handle->flags);
-    return PTE_OS_OK;
+  DEBUG("releaseosSemaphorePost\n");
+
+  handle->flags = STATE_LOCK(&(handle->lock));
+  handle->count += count;
+  // int old = pte_osAtomicAdd(&(handle->count), count);
+  int a = count;
+  if (a > handle->sleepcount) {
+    a = handle->sleepcount;
+  }
+  handle->sleepcount -= a;
+  while (a--) {
+    nk_wait_queue_wake_one(handle->wait_queue);
+  }
+
+  STATE_UNLOCK(&(handle->lock), handle->flags);
+  return PTE_OS_OK;
 }
 
 /*====================================================================================*
@@ -369,78 +380,77 @@ pte_osResult pte_osSemaphorePost(pte_osSemaphoreHandle handle, int count){
  * @return PTE_OS_TIMEOUT - Timeout expired before semaphore was obtained.
  *======================================================================================*/
 
-pte_osResult pte_osSemaphorePend(pte_osSemaphoreHandle handle, unsigned int *pTimeout){
+pte_osResult pte_osSemaphorePend(pte_osSemaphoreHandle handle, unsigned int* pTimeout)
+{
 
- 
-   int busy_wait = 0;
- 
-   if(pTimeout == NULL){
-     while(1){
-       DEBUG("osSemaphoreBusyWaitPend\n");
-       handle->flags = STATE_LOCK(&(handle->lock));
-       if(handle->count > 0){
-	 handle->count--;
-         //pte_osAtomicDecrement(&(handle->count));;
-     	 STATE_UNLOCK(&(handle->lock), handle->flags);
-     	 return PTE_OS_OK;
-       }else{
-     	 STATE_UNLOCK(&(handle->lock), handle->flags);
-	 busy_wait++;
-	 if(busy_wait > ZOMBIE){
-           busy_wait=0;
-	   if(ZOMBIE_mode)
-	      break;
-	 }
-	 nk_yield();
-       }
-     }
-     // We are ZOMBIE NOW! GO to sleep!
-     while(1){
-       DEBUG("osSemaphoreSleepPend\n");
-       handle->flags = STATE_LOCK(&(handle->lock));
-       if(handle->count > 0){
-	 handle->count--;
-	 //int ori =  pte_osAtomicDecrement(&(handle->count));
-     	 STATE_UNLOCK(&(handle->lock), handle->flags);
-     	 return PTE_OS_OK;
-       }else{
-        //we need to gracefully put ourselves to sleep
-        nk_thread_t *t = get_cur_thread();
-	
+  int busy_wait = 0;
+
+  if (pTimeout == NULL) {
+    while (1) {
+      DEBUG("osSemaphoreBusyWaitPend\n");
+      handle->flags = STATE_LOCK(&(handle->lock));
+      if (handle->count > 0) {
+        handle->count--;
+        // pte_osAtomicDecrement(&(handle->count));;
+        STATE_UNLOCK(&(handle->lock), handle->flags);
+        return PTE_OS_OK;
+      } else {
+        STATE_UNLOCK(&(handle->lock), handle->flags);
+        busy_wait++;
+        if (busy_wait > ZOMBIE) {
+          busy_wait = 0;
+          if (ZOMBIE_mode)
+            break;
+        }
+        nk_yield();
+      }
+    }
+    // We are ZOMBIE NOW! GO to sleep!
+    while (1) {
+      DEBUG("osSemaphoreSleepPend\n");
+      handle->flags = STATE_LOCK(&(handle->lock));
+      if (handle->count > 0) {
+        handle->count--;
+        // int ori =  pte_osAtomicDecrement(&(handle->count));
+        STATE_UNLOCK(&(handle->lock), handle->flags);
+        return PTE_OS_OK;
+      } else {
+        // we need to gracefully put ourselves to sleep
+        nk_thread_t* t = get_cur_thread();
+
         // disable preemption early since interrupts may remain on given our locking model
         preempt_disable();
-	t->status = NK_THR_WAITING;
-        nk_wait_queue_enqueue(handle->wait_queue,t);
+        t->status = NK_THR_WAITING;
+        nk_wait_queue_enqueue(handle->wait_queue, t);
         handle->sleepcount++;
-	//pte_osAtomicIncrement(&(handle->sleepcount));
+        // pte_osAtomicIncrement(&(handle->sleepcount));
 
-	// and go to sleep - this will also release the lock
+        // and go to sleep - this will also release the lock
         // and reenable preemption
         nk_sched_sleep(&(handle->lock));
-	DEBUG("thread wake up from sleep\n");
-	irq_enable_restore(handle->flags);
-	
-       }
-     }
-   }else{
-  
+        DEBUG("thread wake up from sleep\n");
+        irq_enable_restore(handle->flags);
+      }
+    }
+  } else {
+
     DEBUG("timed pend semaphore\n");
-    unsigned int start = (unsigned int) nk_sched_get_realtime();
+    unsigned int start = (unsigned int)nk_sched_get_realtime();
     unsigned int end = start;
     int res = -1;
-    while( (end-start) < (*pTimeout)*NS ){
-      DEBUG("osSemaphorePend %d \n", end-start);
+    while ((end - start) < (*pTimeout) * NS) {
+      DEBUG("osSemaphorePend %d \n", end - start);
       handle->flags = STATE_LOCK(&(handle->lock));
-      if(handle->count > 0){
-	handle->count--;
-	//pte_osAtomicDecrement(&(handle->count));
-	 STATE_UNLOCK(&(handle->lock), handle->flags);
-	 return PTE_OS_OK;
-       }else{
-	 STATE_UNLOCK(&(handle->lock), handle->flags);
-	 nk_yield();
-       }
-       end = (unsigned int) nk_sched_get_realtime();
+      if (handle->count > 0) {
+        handle->count--;
+        // pte_osAtomicDecrement(&(handle->count));
+        STATE_UNLOCK(&(handle->lock), handle->flags);
+        return PTE_OS_OK;
+      } else {
+        STATE_UNLOCK(&(handle->lock), handle->flags);
+        nk_yield();
+      }
+      end = (unsigned int)nk_sched_get_realtime();
     }
     return PTE_OS_TIMEOUT;
   }
@@ -459,13 +469,13 @@ pte_osResult pte_osSemaphorePend(pte_osSemaphoreHandle handle, unsigned int *pTi
  * @return PTE_OS_OK - Semaphore successfully acquired.
  * @return PTE_OS_TIMEOUT - Timeout expired before semaphore was obtained.
  ================================================================================================*/
-pte_osResult pte_osSemaphoreCancellablePend(pte_osSemaphoreHandle handle, unsigned int *pTimeout){
+pte_osResult pte_osSemaphoreCancellablePend(pte_osSemaphoreHandle handle, unsigned int* pTimeout)
+{
 
-     //cancel not allowed !!!
-     BOGUS();
-     return pte_osSemaphorePend(handle, pTimeout);
+  // cancel not allowed !!!
+  BOGUS();
+  return pte_osSemaphorePend(handle, pTimeout);
 }
-
 
 /*===============================================================
  * Sets the thread specific value for the specified key for the
@@ -474,10 +484,11 @@ pte_osResult pte_osSemaphoreCancellablePend(pte_osSemaphoreHandle handle, unsign
  * @param index The TLS key for the value.
  * @param value The value to save
  *===============================================================*/
-pte_osResult pte_osTlsSetValue(unsigned int key, void * value){
-   DEBUG("pte_osTlsSetvalue\n");
-   nk_tls_set(key, value);
-   return PTE_OS_OK;
+pte_osResult pte_osTlsSetValue(unsigned int key, void* value)
+{
+  DEBUG("pte_osTlsSetvalue\n");
+  nk_tls_set(key, value);
+  return PTE_OS_OK;
 }
 
 /**
@@ -490,17 +501,19 @@ pte_osResult pte_osTlsSetValue(unsigned int key, void * value){
  *
  * @return The value associated with @p key for the current thread.
  */
-void * pte_osTlsGetValue(unsigned int key){
-   DEBUG("osTlsGetValue\n");
-   return nk_tls_get(key);
+void* pte_osTlsGetValue(unsigned int key)
+{
+  DEBUG("osTlsGetValue\n");
+  return nk_tls_get(key);
 }
 
 /*=====================================================================*
  * Initializes the OS TLS support.  This is called by the PTE library
  * prior to performing ANY TLS operation.
  *====================================================================*/
-void pte_osTlsInit(void){
-  //skip
+void pte_osTlsInit(void)
+{
+  // skip
 }
 
 /*===============================================================*
@@ -512,7 +525,8 @@ void pte_osTlsInit(void){
  * @return PTE_OS_NO_RESOURCESs - Insufficient resources to allocate key (e.g.
  *                         maximum number of keys reached).
  *===================================================================*/
-pte_osResult pte_osTlsAlloc(unsigned int *pKey){
+pte_osResult pte_osTlsAlloc(unsigned int* pKey)
+{
   DEBUG("osTlsAlloc\n");
   nk_tls_key_create(pKey, NULL);
   return PTE_OS_OK;
@@ -523,7 +537,8 @@ pte_osResult pte_osTlsAlloc(unsigned int *pKey){
  * @param index TLS key to free
  * @return PTE_OS_OK - TLS key was successfully freed.
  *================================================================*/
-pte_osResult pte_osTlsFree(unsigned int key){
+pte_osResult pte_osTlsFree(unsigned int key)
+{
   DEBUG("osTlsFree\n");
   nk_tls_key_delete(key);
   return PTE_OS_OK;
@@ -535,9 +550,10 @@ pte_osResult pte_osTlsFree(unsigned int key){
  * @param val Value to be exchanged
  * @return original value of destination
  *=================================================================*/
-int pte_osAtomicExchange(int *pTarg, int val){
+int pte_osAtomicExchange(int* pTarg, int val)
+{
 
-  return __atomic_exchange_n(pTarg,val,__ATOMIC_SEQ_CST);
+  return __atomic_exchange_n(pTarg, val, __ATOMIC_SEQ_CST);
 }
 
 /*========================================================================================*
@@ -548,11 +564,12 @@ int pte_osAtomicExchange(int *pTarg, int val){
  * @param comp The value to compare to destination.
  * @return Original value of destination
  *==========================================================================================*/
-int pte_osAtomicCompareExchange(int *pdest, int exchange, int comp){
-    DEBUG("AtomicCompareEXCHANGE");
-  return atomic_cmpswap(pdest,comp,exchange);
+int pte_osAtomicCompareExchange(int* pdest, int exchange, int comp)
+{
+  DEBUG("AtomicCompareEXCHANGE");
+  return atomic_cmpswap(pdest, comp, exchange);
   // return atomic_cmpswap(pdest, comp, exchange);
-} 
+}
 
 /*=================================================================*
  * Adds the value to target as an atomic operation
@@ -560,7 +577,8 @@ int pte_osAtomicCompareExchange(int *pdest, int exchange, int comp){
  * @param value Value to be added to the variable.
  * @return Original value of destination
  *=================================================================*/
-int  pte_osAtomicExchangeAdd(int volatile* pdest, int value){
+int pte_osAtomicExchangeAdd(int volatile* pdest, int value)
+{
 
   DEBUG("AtomicEXCHANGEAdd\n");
   return __sync_fetch_and_add(pdest, value);
@@ -570,29 +588,30 @@ int  pte_osAtomicExchangeAdd(int volatile* pdest, int value){
  * @param pdest Destination value to decrement
  * @return Original destination value
  *=================================================================*/
-int pte_osAtomicDecrement(int *pdest){
-  
-   DEBUG("AtomicDecrement\n" );
-  return __sync_fetch_and_sub(pdest,1);
+int pte_osAtomicDecrement(int* pdest)
+{
+
+  DEBUG("AtomicDecrement\n");
+  return __sync_fetch_and_sub(pdest, 1);
 }
 
-int pte_osAtomicIncrement(int *pdest){
-    DEBUG("AtomicIncrement\n");
-  return __sync_fetch_and_add(pdest,1);
-
+int pte_osAtomicIncrement(int* pdest)
+{
+  DEBUG("AtomicIncrement\n");
+  return __sync_fetch_and_add(pdest, 1);
 }
 
-//Not used
-int ftime(struct timeb *tb){
+// Not used
+int ftime(struct timeb* tb)
+{
   tb->time = 0;
   tb->millitm = 0;
   tb->timezone = 0;
-  tb->dstflag=0;
+  tb->dstflag = 0;
   return 0;
 }
 
-
-//Not Used
+// Not Used
 /* #define SEMAPHORE_LOCK_CONF uint8_t _semaphore_lock_flags */
 /* #define SEMAPHORE_LOCK(s) _semaphore_lock_flags = spin_lock_irq_save(&(s)->lock) */
 /* #define SEMAPHORE_TRY_LOCK(s) spin_try_lock_irq_save(&(s)->lock,&_semaphore_lock_flags) */
@@ -624,7 +643,7 @@ int ftime(struct timeb *tb){
 /*          DEBUG("pending done\n"); */
 /* 	 return PTE_OS_OK; */
 /*        }else{ */
-	 
+
 /* 	 //	 STATE_UNLOCK(&(handle->lock), handle->flags); */
 /* 	 //nk_yield(); */
 /* 	 nk_thread_t *t = get_cur_thread(); */
@@ -668,16 +687,15 @@ int ftime(struct timeb *tb){
 /*    } */
 /* } */
 
-
 // not included in the base pthread library
 // and currently impossible in NK since there
 // are no forks
 
 int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void))
 {
-    DEBUG("no support for pthrad_atfork()\n");
-    
-    //kmp fail at __kmp_register_atfork() with return -1
-    return 0;
-   // return -1;
+  DEBUG("no support for pthrad_atfork()\n");
+
+  // kmp fail at __kmp_register_atfork() with return -1
+  return 0;
+  // return -1;
 }
